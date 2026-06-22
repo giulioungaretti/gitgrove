@@ -12,7 +12,7 @@
 #![allow(clippy::must_use_candidate)]
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::env;
 use std::error::Error;
 use std::ffi::OsStr;
@@ -130,19 +130,11 @@ struct Worktree {
     locked: bool,
 }
 
-struct Branch {
-    name: String,
-    sha: String,
-    upstream: Option<String>,
-    /// True when this branch is checked out in *any* of the repo's worktrees.
-    checked_out: bool,
-}
-
 struct Repo {
     /// The main worktree path, used as the display root.
     root: PathBuf,
+    remotes: Vec<(String, String)>,
     worktrees: Vec<Worktree>,
-    branches: Vec<Branch>,
 }
 
 // ---------------------------------------------------------------------------
@@ -220,35 +212,18 @@ fn parse_worktrees(dir: &Path) -> Result<Vec<Worktree>, GitError> {
     Ok(trees)
 }
 
-fn parse_branches(dir: &Path) -> Result<Vec<Branch>, GitError> {
-    // Tab-separated and ordered most-recent-first. Ref names cannot contain
-    // tabs, so every well-formed line has exactly three fields.
-    let fmt = "%(refname:short)\t%(objectname:short)\t%(upstream:short)";
-    let out = git(
-        dir,
-        &[
-            "for-each-ref",
-            "--sort=-committerdate",
-            &format!("--format={fmt}"),
-            "refs/heads",
-        ],
-    )?;
-
-    Ok(out
-        .lines()
-        .filter_map(|line| {
-            let fields: Vec<&str> = line.split('\t').collect();
-            let [name, sha, upstream] = fields.as_slice() else {
-                return None;
-            };
-            Some(Branch {
-                name: (*name).to_owned(),
-                sha: (*sha).to_owned(),
-                upstream: (!upstream.is_empty()).then(|| (*upstream).to_owned()),
-                checked_out: false,
-            })
-        })
-        .collect())
+/// Configured remotes as `(name, fetch-url)` pairs, sorted by name.
+fn parse_remotes(dir: &Path) -> Result<Vec<(String, String)>, GitError> {
+    let out = git(dir, &["remote", "-v"])?;
+    // Lines look like `origin<TAB>url (fetch|push)`; keep one url per remote.
+    let mut seen: BTreeMap<String, String> = BTreeMap::new();
+    for line in out.lines() {
+        let mut fields = line.split_whitespace();
+        if let (Some(name), Some(url)) = (fields.next(), fields.next()) {
+            seen.entry(name.to_owned()).or_insert_with(|| url.to_owned());
+        }
+    }
+    Ok(seen.into_iter().collect())
 }
 
 /// Gather everything about a single repository, identified by `dir` (any path
@@ -268,17 +243,12 @@ fn build_repo(dir: &Path) -> Repo {
         warn(&err);
         Vec::new()
     });
-    let mut branches = parse_branches(&root).unwrap_or_else(|err| {
+    let remotes = parse_remotes(&root).unwrap_or_else(|err| {
         warn(&err);
         Vec::new()
     });
 
-    let checked: HashSet<&str> = worktrees.iter().filter_map(|w| w.branch.as_deref()).collect();
-    for b in &mut branches {
-        b.checked_out = checked.contains(b.name.as_str());
-    }
-
-    Repo { root, worktrees, branches }
+    Repo { root, remotes, worktrees }
 }
 
 // ---------------------------------------------------------------------------
@@ -337,16 +307,14 @@ fn render(repos: &[Repo], base: &Path, s: &Style) -> io::Result<()> {
     let stdout = io::stdout();
     let mut out = io::BufWriter::new(stdout.lock());
 
-    let total_branches: usize = repos.iter().map(|r| r.branches.len()).sum();
     let total_worktrees: usize = repos.iter().map(|r| r.worktrees.len()).sum();
 
     writeln!(
         out,
-        "\n{} {}  ({}, {})\n",
+        "\n{} {}  ({})\n",
         s.green("🌳"),
         s.bold(&format!("{} repositories", repos.len())),
         s.dim(&format!("{total_worktrees} worktrees")),
-        s.dim(&format!("{total_branches} branches")),
     )?;
 
     for repo in repos {
@@ -359,8 +327,25 @@ fn render(repos: &[Repo], base: &Path, s: &Style) -> io::Result<()> {
             s.dim(&rel_display(&repo.root, base)),
         )?;
 
-        if !repo.worktrees.is_empty() {
-            writeln!(out, "  {} {}", s.dim("├─"), s.bold("worktrees"))?;
+        // Remotes ---------------------------------------------------------
+        // Worktrees always follow as the final section, so each remote line
+        // uses a branching connector.
+        for (rname, url) in &repo.remotes {
+            writeln!(
+                out,
+                "  {} {} {}  {}",
+                s.dim("├─"),
+                s.bold("remote"),
+                s.magenta(rname),
+                s.dim(url),
+            )?;
+        }
+
+        // Worktrees (each shows the branch currently checked out there) -----
+        if repo.worktrees.is_empty() {
+            writeln!(out, "  {} {}", s.dim("└─"), s.dim("no worktrees"))?;
+        } else {
+            writeln!(out, "  {} {}", s.dim("└─"), s.bold("worktrees"))?;
             let last = repo.worktrees.len() - 1;
             for (i, w) in repo.worktrees.iter().enumerate() {
                 let twig = if i == last { "└─" } else { "├─" };
@@ -374,39 +359,11 @@ fn render(repos: &[Repo], base: &Path, s: &Style) -> io::Result<()> {
                 let lock = if w.locked { " 🔒" } else { "" };
                 writeln!(
                     out,
-                    "  {}  {} {}  {}{lock}",
-                    s.dim("│"),
+                    "     {} {}  {}{lock}",
                     s.dim(twig),
                     label,
                     s.dim(&rel_display(&w.path, base)),
                 )?;
-            }
-        }
-
-        if repo.branches.is_empty() {
-            writeln!(out, "  {} {}", s.dim("└─"), s.dim("no local branches"))?;
-        } else {
-            writeln!(
-                out,
-                "  {} {} {}",
-                s.dim("└─"),
-                s.bold("branches"),
-                s.dim(&format!("({})", repo.branches.len())),
-            )?;
-            let last = repo.branches.len() - 1;
-            for (i, b) in repo.branches.iter().enumerate() {
-                let twig = if i == last { "└─" } else { "├─" };
-                let (marker, name) = if b.checked_out {
-                    (s.green("●"), s.bold(&s.green(&b.name)).into_owned())
-                } else {
-                    (s.dim("○"), b.name.clone())
-                };
-                let up = b
-                    .upstream
-                    .as_ref()
-                    .map(|u| format!("  {}", s.dim(&format!("↪ {u}"))))
-                    .unwrap_or_default();
-                writeln!(out, "     {} {} {}  {}{up}", s.dim(twig), marker, name, s.yellow(&b.sha))?;
             }
         }
         writeln!(out)?;
