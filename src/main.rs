@@ -289,7 +289,8 @@ fn build_repo(dir: &Path) -> Repo {
 /// repo dir or a linked worktree's `.git` file). Walk errors become warnings.
 fn discover_candidates(root: &Path) -> Vec<PathBuf> {
     let walker = WalkDir::new(root).follow_links(false).into_iter().filter_entry(|e| {
-        // Never descend into a `.git` directory or known noise dirs.
+        // Don't descend into `.git` internals or known noise dirs (but the
+        // directories themselves are still inspected for a `.git` child below).
         if e.file_type().is_dir() {
             if let Some(name) = e.file_name().to_str() {
                 if name == ".git" {
@@ -306,12 +307,14 @@ fn discover_candidates(root: &Path) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     for entry in walker {
         match entry {
-            Ok(entry) if entry.file_name() == OsStr::new(".git") => {
-                if let Some(parent) = entry.path().parent() {
-                    candidates.push(parent.to_path_buf());
+            Ok(entry) => {
+                // A repo is any directory holding a `.git` entry: a `.git`
+                // directory for a normal checkout, or a `.git` file for a
+                // linked worktree.
+                if entry.file_type().is_dir() && entry.path().join(".git").exists() {
+                    candidates.push(entry.into_path());
                 }
             }
-            Ok(_) => {}
             Err(err) => eprintln!("warning: {err}"),
         }
     }
