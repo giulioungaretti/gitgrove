@@ -1,0 +1,15 @@
+[package]
+name = "gitgrove"
+version = "0.1.0"
+edition = "2021"
+description = "Recursively discover git repositories and show their worktrees and branches in a friendly tree view."
+license = "MIT"
+
+[dependencies]
+rayon = "1.10"
+walkdir = "2.5"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
