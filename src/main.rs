@@ -303,6 +303,17 @@ fn rel_display(path: &Path, base: &Path) -> String {
     }
 }
 
+/// The label shown for a worktree: its checked-out branch, or its bare/detached state.
+fn worktree_label<'a>(w: &'a Worktree, s: &Style) -> Cow<'a, str> {
+    if w.bare {
+        s.yellow("(bare)")
+    } else if w.detached {
+        Cow::Owned(s.red(&format!("detached @ {}", w.head)).into_owned())
+    } else {
+        s.green(w.branch.as_deref().unwrap_or("?"))
+    }
+}
+
 fn render(repos: &[Repo], base: &Path, s: &Style) -> io::Result<()> {
     let stdout = io::stdout();
     let mut out = io::BufWriter::new(stdout.lock());
@@ -319,51 +330,69 @@ fn render(repos: &[Repo], base: &Path, s: &Style) -> io::Result<()> {
 
     for repo in repos {
         let name = repo.root.file_name().and_then(OsStr::to_str).unwrap_or("?");
-        writeln!(
-            out,
-            "{} {}  {}",
-            s.magenta("📦"),
-            s.bold(name),
-            s.dim(&rel_display(&repo.root, base)),
-        )?;
+
+        // A single worktree *is* the repo folder, so fold its branch into the
+        // header rather than printing a redundant one-item worktrees section.
+        let single = match repo.worktrees.as_slice() {
+            [only] => Some(only),
+            _ => None,
+        };
+
+        if let Some(w) = single {
+            let lock = if w.locked { " 🔒" } else { "" };
+            writeln!(
+                out,
+                "{} {}  {}  {}{lock}",
+                s.magenta("📦"),
+                s.bold(name),
+                s.dim(&rel_display(&repo.root, base)),
+                worktree_label(w, s),
+            )?;
+        } else {
+            writeln!(
+                out,
+                "{} {}  {}",
+                s.magenta("📦"),
+                s.bold(name),
+                s.dim(&rel_display(&repo.root, base)),
+            )?;
+        }
 
         // Remotes ---------------------------------------------------------
-        // Worktrees always follow as the final section, so each remote line
-        // uses a branching connector.
-        for (rname, url) in &repo.remotes {
+        // When a worktrees section follows, remotes always branch (`├─`);
+        // otherwise the last remote closes the repo (`└─`).
+        let remotes_are_last = single.is_some();
+        let rlast = repo.remotes.len().saturating_sub(1);
+        for (i, (rname, url)) in repo.remotes.iter().enumerate() {
+            let twig = if remotes_are_last && i == rlast { "└─" } else { "├─" };
             writeln!(
                 out,
                 "  {} {} {}  {}",
-                s.dim("├─"),
+                s.dim(twig),
                 s.bold("remote"),
                 s.magenta(rname),
                 s.dim(url),
             )?;
         }
 
-        // Worktrees (each shows the branch currently checked out there) -----
-        if repo.worktrees.is_empty() {
-            writeln!(out, "  {} {}", s.dim("└─"), s.dim("no worktrees"))?;
-        } else {
-            writeln!(out, "  {} {}", s.dim("└─"), s.bold("worktrees"))?;
-            let last = repo.worktrees.len() - 1;
-            for (i, w) in repo.worktrees.iter().enumerate() {
-                let twig = if i == last { "└─" } else { "├─" };
-                let label = if w.bare {
-                    s.yellow("(bare)")
-                } else if w.detached {
-                    Cow::Owned(s.red(&format!("detached @ {}", w.head)).into_owned())
-                } else {
-                    s.green(w.branch.as_deref().unwrap_or("?"))
-                };
-                let lock = if w.locked { " 🔒" } else { "" };
-                writeln!(
-                    out,
-                    "     {} {}  {}{lock}",
-                    s.dim(twig),
-                    label,
-                    s.dim(&rel_display(&w.path, base)),
-                )?;
+        // Worktrees — only when there are several (or none to report) --------
+        if single.is_none() {
+            if repo.worktrees.is_empty() {
+                writeln!(out, "  {} {}", s.dim("└─"), s.dim("no worktrees"))?;
+            } else {
+                writeln!(out, "  {} {}", s.dim("└─"), s.bold("worktrees"))?;
+                let last = repo.worktrees.len() - 1;
+                for (i, w) in repo.worktrees.iter().enumerate() {
+                    let twig = if i == last { "└─" } else { "├─" };
+                    let lock = if w.locked { " 🔒" } else { "" };
+                    writeln!(
+                        out,
+                        "     {} {}  {}{lock}",
+                        s.dim(twig),
+                        worktree_label(w, s),
+                        s.dim(&rel_display(&w.path, base)),
+                    )?;
+                }
             }
         }
         writeln!(out)?;
